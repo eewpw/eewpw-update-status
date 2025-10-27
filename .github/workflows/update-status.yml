@@ -1,0 +1,114 @@
+name: Publish image update status
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eewpw-update-status
+  cancel-in-progress: true
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # --- GHCR digests (public images) ---
+      - name: Get backend digest from GHCR
+        id: be
+        env:
+          REPO: eewpw/eewpw-backend
+        run: |
+          set -e
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" | jq -r .token)
+          TAGS_JSON=$(curl -fsSL -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/${REPO}/tags/list")
+          PREF=$(echo "$TAGS_JSON" | jq -r '.tags // [] | map(select(. == "master" or . == "main" or . == "latest")) | .[0]')
+          if [ -z "$PREF" ] || [ "$PREF" = "null" ]; then
+            PREF=$(echo "$TAGS_JSON" | jq -r '.tags // [] | .[0]')
+          fi
+          [ -n "$PREF" ] || { echo "No tags for ${REPO}"; exit 1; }
+          HEADERS=$(mktemp)
+          curl -s -o /dev/null -w "%{http_code}" -I \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+            -D "$HEADERS" "https://ghcr.io/v2/${REPO}/manifests/${PREF}" >/dev/null
+          DIGEST=$(grep -i '^Docker-Content-Digest:' "$HEADERS" | awk '{print $2}' | tr -d '\r')
+          [ -n "$DIGEST" ] || { echo "No digest for ${REPO}:${PREF}"; exit 1; }
+          echo "tag=$PREF" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Get frontend digest from GHCR
+        id: fe
+        env:
+          REPO: eewpw/eewpw-dashboard
+        run: |
+          set -e
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" | jq -r .token)
+          TAGS_JSON=$(curl -fsSL -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/${REPO}/tags/list")
+          PREF=$(echo "$TAGS_JSON" | jq -r '.tags // [] | map(select(. == "master" or . == "main" or . == "latest")) | .[0]')
+          if [ -z "$PREF" ] || [ "$PREF" = "null" ]; then
+            PREF=$(echo "$TAGS_JSON" | jq -r '.tags // [] | .[0]')
+          fi
+          [ -n "$PREF" ] || { echo "No tags for ${REPO}"; exit 1; }
+          HEADERS=$(mktemp)
+          curl -s -o /dev/null -w "%{http_code}" -I \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+            -D "$HEADERS" "https://ghcr.io/v2/${REPO}/manifests/${PREF}" >/dev/null
+          DIGEST=$(grep -i '^Docker-Content-Digest:' "$HEADERS" | awk '{print $2}' | tr -d '\r')
+          [ -n "$DIGEST" ] || { echo "No digest for ${REPO}:${PREF}"; exit 1; }
+          echo "tag=$PREF" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Build new update.json
+        id: buildjson
+        run: |
+          set -e
+          NEW_BE="${{ steps.be.outputs.digest }}"
+          NEW_FE="${{ steps.fe.outputs.digest }}"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n --arg be "$NEW_BE" --arg fe "$NEW_FE" --arg ts "$TS" \
+            '{backend:{digest:$be}, frontend:{digest:$fe}, updated:$ts}' > update.new.json
+
+      - name: Compare with existing file
+        id: cmp
+        run: |
+          set -e
+          if [ -f update.json ]; then
+            OLD_BE=$(jq -r '.backend.digest // empty' update.json)
+            OLD_FE=$(jq -r '.frontend.digest // empty' update.json)
+          else
+            OLD_BE=""; OLD_FE=""
+          fi
+          NEW_BE=$(jq -r '.backend.digest' update.new.json)
+          NEW_FE=$(jq -r '.frontend.digest' update.new.json)
+          echo "old_be=$OLD_BE" >> $GITHUB_OUTPUT
+          echo "old_fe=$OLD_FE" >> $GITHUB_OUTPUT
+          echo "new_be=$NEW_BE" >> $GITHUB_OUTPUT
+          echo "new_fe=$NEW_FE" >> $GITHUB_OUTPUT
+          if [ "$OLD_BE" != "$NEW_BE" ] || [ "$OLD_FE" != "$NEW_FE" ] || [ ! -f update.json ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit update.json if changed
+        if: steps.cmp.outputs.changed == 'true'
+        run: |
+          set -e
+          mv -f update.new.json update.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update.json
+          git commit -m "chore: update image digests [skip ci]"
+          git push
